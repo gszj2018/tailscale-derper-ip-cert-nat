@@ -37,6 +37,58 @@ import (
 // See https://letsencrypt.org/docs/profiles/.
 const shortlivedProfile = "shortlived"
 
+// ipCertConfig holds the IP certificate settings. Invalid static addresses
+// mean that the connection's local address is used for that address family.
+type ipCertConfig struct {
+	enabled   bool
+	staticIP4 netip.Addr
+	staticIP6 netip.Addr
+}
+
+// parseIPCertConfig validates the command-line IP certificate settings.
+func parseIPCertConfig(mode string, enabled bool, staticIP4, staticIP6 string) (ipCertConfig, error) {
+	cfg := ipCertConfig{enabled: enabled}
+	if enabled && mode != "letsencrypt" {
+		return cfg, errors.New("--acme-ip-certs requires --certmode=letsencrypt")
+	}
+	if !enabled && (staticIP4 != "" || staticIP6 != "") {
+		return cfg, errors.New("--acme-src-ip and --acme-src-ip6 require --acme-ip-certs")
+	}
+	for _, v := range []struct {
+		flag  string
+		value string
+		ipv4  bool
+		dst   *netip.Addr
+	}{
+		{"--acme-src-ip", staticIP4, true, &cfg.staticIP4},
+		{"--acme-src-ip6", staticIP6, false, &cfg.staticIP6},
+	} {
+		if v.value == "" {
+			continue
+		}
+		ip, err := netip.ParseAddr(v.value)
+		if err != nil {
+			return cfg, fmt.Errorf("%s: invalid IP address %q: %w", v.flag, v.value, err)
+		}
+		if ip.Zone() != "" {
+			return cfg, fmt.Errorf("%s: address %q must not have a zone", v.flag, v.value)
+		}
+		ip = ip.Unmap()
+		if ip.IsUnspecified() || ip.IsMulticast() {
+			return cfg, fmt.Errorf("%s: address %q must not be unspecified or multicast", v.flag, v.value)
+		}
+		if ip.Is4() != v.ipv4 {
+			family := "IPv6"
+			if v.ipv4 {
+				family = "IPv4"
+			}
+			return cfg, fmt.Errorf("%s: address %q must be %s", v.flag, v.value, family)
+		}
+		*v.dst = ip
+	}
+	return cfg, nil
+}
+
 // ipCertManager is a certProvider that obtains and renews LetsEncrypt
 // TLS certificates for the server's IP addresses on demand, using the
 // short-lived ACME certificate profile and the HTTP-01 challenge
@@ -44,11 +96,11 @@ const shortlivedProfile = "shortlived"
 //
 // Clients connecting to an IP address usually send no SNI, so the
 // requested IP address is taken from the TCP connection's local
-// address. That works for however many IPv4 and IPv6 addresses the
-// server has, with no configuration. Clients that do send an IP
-// address in the SNI get a certificate only if it matches the
-// connection's local address, so a client can never make us request a
-// certificate for an address that isn't ours.
+// address, unless a static address is configured for that address
+// family (for example, the public address of an inbound NAT mapping).
+// Clients that do send an IP address in the SNI get a certificate only
+// if it matches this effective certificate address, so a client can
+// never make us request a certificate for an arbitrary address.
 //
 // Connections with a DNS name in the SNI are passed through to the
 // optional next provider (the regular autocert manager for the
@@ -59,6 +111,7 @@ type ipCertManager struct {
 	client  *acme.Client
 	next    certProvider // provider for DNS hostname connections, or nil
 	nextTLS *tls.Config  // next.TLSConfig(), or nil
+	ipCerts ipCertConfig // immutable static address overrides
 
 	mu     sync.Mutex
 	certs  map[netip.Addr]*ipCertEntry
@@ -81,8 +134,9 @@ type ipCertEntry struct {
 //
 // If directoryURL is empty, the LetsEncrypt production directory is
 // used; tests point it at a fake ACME server. If next is non-nil,
-// connections with a DNS name in the SNI are served by it.
-func newIPCertManager(certdir, email, directoryURL string, next certProvider) (*ipCertManager, error) {
+// connections with a DNS name in the SNI are served by it. ipCerts can
+// override the certificate address for each local connection address family.
+func newIPCertManager(certdir, email, directoryURL string, ipCerts ipCertConfig, next certProvider) (*ipCertManager, error) {
 	if err := os.MkdirAll(certdir, 0700); err != nil {
 		return nil, err
 	}
@@ -98,9 +152,10 @@ func newIPCertManager(certdir, email, directoryURL string, next certProvider) (*
 			DirectoryURL: directoryURL,
 			UserAgent:    "tailscale-derper",
 		},
-		next:   next,
-		certs:  make(map[netip.Addr]*ipCertEntry),
-		tokens: make(map[string]string),
+		next:    next,
+		ipCerts: ipCerts,
+		certs:   make(map[netip.Addr]*ipCertEntry),
+		tokens:  make(map[string]string),
 	}
 	if next != nil {
 		m.nextTLS = next.TLSConfig()
@@ -173,6 +228,12 @@ func connLocalIP(hi *tls.ClientHelloInfo) (netip.Addr, bool) {
 
 func (m *ipCertManager) getCertificate(hi *tls.ClientHelloInfo) (*tls.Certificate, error) {
 	connIP, connIPOK := connLocalIP(hi)
+	certIP := connIP
+	if connIP.Is4() && m.ipCerts.staticIP4.IsValid() {
+		certIP = m.ipCerts.staticIP4
+	} else if connIP.Is6() && m.ipCerts.staticIP6.IsValid() {
+		certIP = m.ipCerts.staticIP6
+	}
 	if hi.ServerName != "" {
 		sniIP, err := netip.ParseAddr(hi.ServerName)
 		if err != nil {
@@ -182,8 +243,8 @@ func (m *ipCertManager) getCertificate(hi *tls.ClientHelloInfo) (*tls.Certificat
 			}
 			return nil, fmt.Errorf("no certificate for hostname %q; this server only serves IP address certificates", hi.ServerName)
 		}
-		if !connIPOK || sniIP.Unmap() != connIP {
-			return nil, fmt.Errorf("requested certificate for IP %v does not match the connection's IP address", sniIP)
+		if !connIPOK || sniIP.Unmap() != certIP {
+			return nil, fmt.Errorf("requested certificate for IP %v does not match the connection's certificate IP address %v", sniIP, certIP)
 		}
 	}
 	if !connIPOK {
@@ -193,7 +254,7 @@ func (m *ipCertManager) getCertificate(hi *tls.ClientHelloInfo) (*tls.Certificat
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	return m.certForIP(ctx, connIP)
+	return m.certForIP(ctx, certIP)
 }
 
 // certForIP returns the current certificate for ip, obtaining one

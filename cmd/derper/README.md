@@ -77,6 +77,48 @@ rely on its DNS which might be broken and dependent on DERP to get back up.
 
 * Don't rate-limit outbound TCP traffic (only inbound).
 
+## ACME IP certificates behind inbound NAT
+
+With `--certmode=letsencrypt --acme-ip-certs`, derper obtains and renews
+short-lived IP certificates on demand. By default, the certificate address is
+selected from the accepted TCP connection's local IP address. Behind inbound
+NAT this can be an internal address rather than the public IP used by clients.
+
+Use `--acme-src-ip` to specify the certificate IP for IPv4 connections,
+and `--acme-src-ip6` for IPv6 connections. For example (replace the
+example addresses with your actual public addresses):
+
+```sh
+derper \
+  --certmode=letsencrypt \
+  --acme-ip-certs \
+  --acme-src-ip=203.0.113.7 \
+  --acme-src-ip6=2001:db8::7 \
+  --hostname=203.0.113.7
+```
+
+* Both static address flags default to empty. You can omit either one; that
+  address family will continue to use the connection's local IP. The flags
+  require `--acme-ip-certs` and `--certmode=letsencrypt`. They only affect
+  certificate selection when derper serves TLS.
+* Address selection uses the local connection's address family. These flags
+  support same-family inbound NAT, not NAT64 or other cross-family forwarding.
+  They do not change listener addresses or bind outbound ACME requests to a
+  particular source address.
+* The ACME CA must be able to reach **public TCP port 80** at each specified IP.
+  Forward it to derper's plaintext HTTP listener (`--http-port`, default 80),
+  which must remain enabled. Forward public TLS traffic to derper's TLS
+  listener without terminating TLS at an upstream proxy.
+* Clients may omit SNI, or send an IP SNI matching the selected certificate IP.
+  Other IP SNI values are rejected. DNS SNI continues to use the hostname
+  certificate provider, if configured.
+* An IP-valued `--hostname` selects IP-only mode without a DNS certificate
+  provider. It does not itself override the certificate IP; configure the
+  static address flags explicitly for NAT. Clients should use the public IP
+  in their DERPMap.
+* Certificates, cache files, and renewals use the selected certificate IP,
+  rather than the internal destination address.
+
 ## Diagnostics
 
 This is not a complete guide on DERP diagnostics.

@@ -19,6 +19,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -244,6 +246,12 @@ func (f *fakeIPACME) issueCert(csrB64 string) error {
 	if len(csr.IPAddresses) != 1 {
 		return fmt.Errorf("CSR has %d IP addresses; want 1", len(csr.IPAddresses))
 	}
+	f.mu.Lock()
+	wantIP := f.gotIDValue
+	f.mu.Unlock()
+	if got := csr.IPAddresses[0].String(); got != wantIP {
+		return fmt.Errorf("CSR IP = %q; want order IP %q", got, wantIP)
+	}
 	tmpl := &x509.Certificate{
 		SerialNumber: big.NewInt(2),
 		IPAddresses:  csr.IPAddresses,
@@ -331,7 +339,7 @@ func TestIPCertManager(t *testing.T) {
 	dir := t.TempDir()
 	ca := newFakeIPACME(t)
 
-	m, err := newIPCertManager(dir, "test@example.com", ca.directoryURL(), nil)
+	m, err := newIPCertManager(dir, "test@example.com", ca.directoryURL(), ipCertConfig{enabled: true}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -396,7 +404,7 @@ func TestIPCertManager(t *testing.T) {
 
 	// A second manager over the same cert directory must use the
 	// on-disk cache rather than creating more orders.
-	m2, err := newIPCertManager(dir, "test@example.com", ca.directoryURL(), nil)
+	m2, err := newIPCertManager(dir, "test@example.com", ca.directoryURL(), ipCertConfig{enabled: true}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -427,7 +435,7 @@ func TestIPCertManagerNextProvider(t *testing.T) {
 	dir := t.TempDir()
 	ca := newFakeIPACME(t)
 	stubCert := &tls.Certificate{}
-	m, err := newIPCertManager(dir, "", ca.directoryURL(), &stubCertProvider{cert: stubCert})
+	m, err := newIPCertManager(dir, "", ca.directoryURL(), ipCertConfig{enabled: true}, &stubCertProvider{cert: stubCert})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -462,7 +470,7 @@ func TestCertModeIPCertsGating(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cp, err := certProviderByCertMode(tt.mode, t.TempDir(), tt.host, tt.ipCerts, "", "", "")
+			cp, err := certProviderByCertMode(tt.mode, t.TempDir(), tt.host, ipCertConfig{enabled: tt.ipCerts}, "", "", "")
 			if tt.wantErr == "" {
 				if err != nil {
 					t.Fatalf("certProviderByCertMode(%q, %q, ipCerts=%v) = %v; want success", tt.mode, tt.host, tt.ipCerts, err)
@@ -482,5 +490,255 @@ func TestCertModeIPCertsGating(t *testing.T) {
 					tt.mode, tt.host, tt.ipCerts, err, tt.wantErr)
 			}
 		})
+	}
+}
+
+func TestParseIPCertConfig(t *testing.T) {
+	tests := []struct {
+		name    string
+		mode    string
+		enabled bool
+		ip4     string
+		ip6     string
+		want4   string
+		want6   string
+		wantErr string
+	}{
+		{name: "disabled", mode: "manual"},
+		{name: "automatic", mode: "letsencrypt", enabled: true},
+		{name: "ipv4", mode: "letsencrypt", enabled: true, ip4: "203.0.113.7", want4: "203.0.113.7"},
+		{name: "ipv6", mode: "letsencrypt", enabled: true, ip6: "2001:db8::7", want6: "2001:db8::7"},
+		{name: "dual_stack", mode: "letsencrypt", enabled: true, ip4: "203.0.113.7", ip6: "2001:0db8::7", want4: "203.0.113.7", want6: "2001:db8::7"},
+		{name: "mapped_ipv4", mode: "letsencrypt", enabled: true, ip4: "::ffff:203.0.113.7", want4: "203.0.113.7"},
+		{name: "ipv4_disabled", mode: "letsencrypt", ip4: "203.0.113.7", wantErr: "require --acme-ip-certs"},
+		{name: "ipv6_disabled", mode: "letsencrypt", ip6: "2001:db8::7", wantErr: "require --acme-ip-certs"},
+		{name: "manual", mode: "manual", enabled: true, ip4: "203.0.113.7", wantErr: "requires --certmode=letsencrypt"},
+		{name: "gcp", mode: "gcp", enabled: true, ip6: "2001:db8::7", wantErr: "requires --certmode=letsencrypt"},
+		{name: "invalid_ipv4", mode: "letsencrypt", enabled: true, ip4: "not-an-ip", wantErr: "--acme-src-ip: invalid IP"},
+		{name: "invalid_ipv6", mode: "letsencrypt", enabled: true, ip6: "not-an-ip", wantErr: "--acme-src-ip6: invalid IP"},
+		{name: "ipv6_in_ipv4", mode: "letsencrypt", enabled: true, ip4: "2001:db8::7", wantErr: "must be IPv4"},
+		{name: "ipv4_in_ipv6", mode: "letsencrypt", enabled: true, ip6: "203.0.113.7", wantErr: "must be IPv6"},
+		{name: "mapped_ipv4_in_ipv6", mode: "letsencrypt", enabled: true, ip6: "::ffff:203.0.113.7", wantErr: "must be IPv6"},
+		{name: "ipv6_zone", mode: "letsencrypt", enabled: true, ip6: "fe80::7%eth0", wantErr: "must not have a zone"},
+		{name: "mapped_ipv4_zone", mode: "letsencrypt", enabled: true, ip4: "::ffff:203.0.113.7%eth0", wantErr: "must not have a zone"},
+		{name: "unspecified_ipv4", mode: "letsencrypt", enabled: true, ip4: "0.0.0.0", wantErr: "must not be unspecified or multicast"},
+		{name: "unspecified_ipv6", mode: "letsencrypt", enabled: true, ip6: "::", wantErr: "must not be unspecified or multicast"},
+		{name: "multicast_ipv4", mode: "letsencrypt", enabled: true, ip4: "224.0.0.1", wantErr: "must not be unspecified or multicast"},
+		{name: "multicast_ipv6", mode: "letsencrypt", enabled: true, ip6: "ff02::1", wantErr: "must not be unspecified or multicast"},
+		{name: "ipv4_with_port", mode: "letsencrypt", enabled: true, ip4: "203.0.113.7:443", wantErr: "--acme-src-ip: invalid IP"},
+		{name: "bracketed_ipv6", mode: "letsencrypt", enabled: true, ip6: "[2001:db8::7]", wantErr: "--acme-src-ip6: invalid IP"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, err := parseIPCertConfig(tt.mode, tt.enabled, tt.ip4, tt.ip6)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("error = %v; want contains %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.enabled != tt.enabled {
+				t.Errorf("enabled = %v; want %v", cfg.enabled, tt.enabled)
+			}
+			for _, v := range []struct {
+				got  netip.Addr
+				want string
+			}{{cfg.staticIP4, tt.want4}, {cfg.staticIP6, tt.want6}} {
+				if v.want == "" {
+					if v.got.IsValid() {
+						t.Errorf("static IP = %v; want unset", v.got)
+					}
+				} else if v.got.String() != v.want {
+					t.Errorf("static IP = %v; want %s", v.got, v.want)
+				}
+			}
+		})
+	}
+}
+
+func TestCertModeStaticIPConfig(t *testing.T) {
+	cfg, err := parseIPCertConfig("letsencrypt", true, "203.0.113.7", "2001:db8::7")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, hostname := range []string{"203.0.113.7", "derp.example.com"} {
+		t.Run(hostname, func(t *testing.T) {
+			cp, err := certProviderByCertMode("letsencrypt", t.TempDir(), hostname, cfg, "", "", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			m, ok := cp.(*ipCertManager)
+			if !ok {
+				t.Fatalf("provider = %T; want *ipCertManager", cp)
+			}
+			if m.ipCerts != cfg {
+				t.Errorf("IP cert config = %+v; want %+v", m.ipCerts, cfg)
+			}
+			if got, want := m.next != nil, hostname == "derp.example.com"; got != want {
+				t.Errorf("has hostname provider = %v; want %v", got, want)
+			}
+		})
+	}
+}
+
+// Simulated local addresses stand in for the destination after inbound NAT.
+// The fake CA verifies HTTP-01 locally; no public IP or IPv6 listener is needed.
+func TestIPCertManagerStaticAddresses(t *testing.T) {
+	tests := []struct {
+		name   string
+		ip4    string
+		ip6    string
+		local4 string
+		local6 string
+	}{
+		{"ipv4_only", "203.0.113.7", "", "10.0.0.7", "2001:db8::8"},
+		{"ipv6_only", "", "2001:db8::7", "203.0.113.8", "fd00::7"},
+		{"dual_stack", "203.0.113.7", "2001:db8::7", "10.0.0.7", "fd00::7"},
+		{"mapped_ipv4", "::ffff:203.0.113.7", "", "::ffff:10.0.0.7", "2001:db8::8"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, err := parseIPCertConfig("letsencrypt", true, tt.ip4, tt.ip6)
+			if err != nil {
+				t.Fatal(err)
+			}
+			dir := t.TempDir()
+			ca := newFakeIPACME(t)
+			stubCert := &tls.Certificate{}
+			m, err := newIPCertManager(dir, "", ca.directoryURL(), cfg, &stubCertProvider{cert: stubCert})
+			if err != nil {
+				t.Fatal(err)
+			}
+			challengeSrv := httptest.NewServer(m.HTTPHandler(http.NotFoundHandler()))
+			defer challengeSrv.Close()
+			ca.challengeBase = challengeSrv.URL
+
+			for i, v := range []struct {
+				local string
+				other string
+				fixed netip.Addr
+			}{
+				{tt.local4, "10.0.0.8", cfg.staticIP4},
+				{tt.local6, "fd00::8", cfg.staticIP6},
+			} {
+				localIP := netip.MustParseAddr(v.local).Unmap()
+				wantIP := localIP
+				if v.fixed.IsValid() {
+					wantIP = v.fixed
+				}
+				cert, err := m.getCertificate(helloFor(t, v.local, ""))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := cert.Leaf.VerifyHostname(wantIP.String()); err != nil {
+					t.Errorf("certificate not valid for %v: %v", wantIP, err)
+				}
+				if v.fixed.IsValid() && cert.Leaf.VerifyHostname(localIP.String()) == nil {
+					t.Errorf("certificate unexpectedly valid for internal IP %v", localIP)
+				}
+				ca.mu.Lock()
+				idType, idValue, profile := ca.gotIDType, ca.gotIDValue, ca.gotProfile
+				ca.mu.Unlock()
+				if idType != "ip" || idValue != wantIP.String() || profile != shortlivedProfile {
+					t.Errorf("order = %q %q profile %q; want ip %v profile %q", idType, idValue, profile, wantIP, shortlivedProfile)
+				}
+				if _, err := m.getCertificate(helloFor(t, v.local, wantIP.String())); err != nil {
+					t.Errorf("matching IP SNI: %v", err)
+				}
+				for _, sni := range []string{"203.0.113.99", "2001:db8::99"} {
+					if _, err := m.getCertificate(helloFor(t, v.local, sni)); err == nil {
+						t.Errorf("mismatched SNI %q succeeded", sni)
+					}
+				}
+				if v.fixed.IsValid() {
+					if _, err := m.getCertificate(helloFor(t, v.local, localIP.String())); err == nil {
+						t.Error("internal IP SNI succeeded with a static override")
+					}
+					if _, err := m.getCertificate(helloFor(t, v.other, "")); err != nil {
+						t.Errorf("second internal address: %v", err)
+					}
+					crtPath, keyPath := m.certPaths(localIP)
+					for _, path := range []string{crtPath, keyPath} {
+						if _, err := os.Stat(path); !os.IsNotExist(err) {
+							t.Errorf("internal IP cache file %s: %v; want not exist", path, err)
+						}
+					}
+				}
+				if _, err := m.loadCachedCert(wantIP); err != nil {
+					t.Errorf("cache for certificate IP %v: %v", wantIP, err)
+				}
+				m.mu.Lock()
+				_, hasEffectiveEntry := m.certs[wantIP]
+				_, hasInternalEntry := m.certs[localIP]
+				m.mu.Unlock()
+				if !hasEffectiveEntry || (v.fixed.IsValid() && hasInternalEntry) {
+					t.Errorf("cache entries: effective=%v internal=%v", hasEffectiveEntry, hasInternalEntry)
+				}
+				if got, want := ca.numOrders(), i+1; got != want {
+					t.Errorf("orders = %d; want %d", got, want)
+				}
+			}
+
+			// DNS SNI still goes to the hostname provider, even under NAT.
+			if cert, err := m.getCertificate(helloFor(t, tt.local4, "derp.example.com")); err != nil || cert != stubCert {
+				t.Errorf("DNS SNI: cert=%p err=%v; want cert=%p", cert, err, stubCert)
+			}
+			for _, sni := range []string{"", "203.0.113.7"} {
+				if _, err := m.getCertificate(&tls.ClientHelloInfo{ServerName: sni}); err == nil {
+					t.Errorf("missing connection with SNI %q succeeded", sni)
+				}
+			}
+
+			// A new manager uses the public-address cache without new orders.
+			m2, err := newIPCertManager(dir, "", ca.directoryURL(), cfg, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, local := range []string{tt.local4, tt.local6} {
+				if _, err := m2.getCertificate(helloFor(t, local, "")); err != nil {
+					t.Errorf("disk cache reuse for %s: %v", local, err)
+				}
+			}
+			if got := ca.numOrders(); got != 2 {
+				t.Errorf("orders after disk cache reuse = %d; want 2", got)
+			}
+		})
+	}
+}
+
+func TestIPCertManagerStaticConcurrent(t *testing.T) {
+	cfg, err := parseIPCertConfig("letsencrypt", true, "203.0.113.7", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ca := newFakeIPACME(t)
+	m, err := newIPCertManager(t.TempDir(), "", ca.directoryURL(), cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	challengeSrv := httptest.NewServer(m.HTTPHandler(http.NotFoundHandler()))
+	defer challengeSrv.Close()
+	ca.challengeBase = challengeSrv.URL
+
+	var wg sync.WaitGroup
+	for _, local := range []string{"10.0.0.7", "10.0.0.8", "10.0.0.9", "::ffff:10.0.0.10"} {
+		hi := helloFor(t, local, "")
+		wg.Go(func() {
+			cert, err := m.getCertificate(hi)
+			if err != nil {
+				t.Errorf("getCertificate: %v", err)
+				return
+			}
+			if err := cert.Leaf.VerifyHostname("203.0.113.7"); err != nil {
+				t.Errorf("certificate: %v", err)
+			}
+		})
+	}
+	wg.Wait()
+	if got := ca.numOrders(); got != 1 {
+		t.Errorf("concurrent orders = %d; want 1", got)
 	}
 }

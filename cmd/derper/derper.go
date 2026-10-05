@@ -67,7 +67,9 @@ var (
 	acmeEABKid  = flag.String("acme-eab-kid", "", "ACME External Account Binding (EAB) Key ID (required for --certmode=gcp)")
 	acmeEABKey  = flag.String("acme-eab-key", "", "ACME External Account Binding (EAB) HMAC key, base64-encoded (required for --certmode=gcp)")
 	acmeEmail   = flag.String("acme-email", "", "ACME account contact email address (required for --certmode=gcp, optional for letsencrypt)")
-	acmeIPCerts = flag.Bool("acme-ip-certs", false, "whether to serve LetsEncrypt certs for the server's IP addresses: when a client connects by IP address (sending no TLS SNI, or an IP address SNI matching the connection's destination IP), get and serve a LetsEncrypt cert for that IP, using the short-lived (~6 day) ACME certificate profile. This works for both IPv4 and IPv6 with no per-address configuration. It requires --certmode=letsencrypt and the ACME server must be able to reach port 80 at each such IP for the HTTP-01 challenge.")
+	acmeIPCerts = flag.Bool("acme-ip-certs", false, "whether to serve LetsEncrypt certs for IP addresses using the short-lived (~6 day) ACME certificate profile. The certificate IP is the connection's local IP unless overridden by --acme-src-ip or --acme-src-ip6. Clients may send no TLS SNI or an IP SNI matching the certificate IP. Requires --certmode=letsencrypt and public port 80 reachability at each certificate IP for HTTP-01 challenges.")
+	acmeSrcIP   = flag.String("acme-src-ip", "", "static IPv4 address for ACME IP certificates on IPv4 connections, e.g. the public IP of an inbound NAT mapping. Requires --acme-ip-certs. Does not change the listener or outbound source address.")
+	acmeSrcIP6  = flag.String("acme-src-ip6", "", "static IPv6 address for ACME IP certificates on IPv6 connections, e.g. the public IP of an inbound NAT mapping. Requires --acme-ip-certs. Does not change the listener or outbound source address.")
 	runSTUN     = flag.Bool("stun", true, "whether to run a STUN server. It will bind to the same IP (if any) as the --addr flag value.")
 	runDERP     = flag.Bool("derp", true, "whether to run a DERP server. The only reason to set this false is if you're decommissioning a server but want to keep its bootstrap DNS functionality still running.")
 	flagHome    = flag.String("home", "", "what to serve at the root path. It may be left empty (the default, for a default homepage), \"blank\" for a blank page, or a URL to redirect to")
@@ -180,6 +182,11 @@ func main() {
 	listenHost, _, err := net.SplitHostPort(*addr)
 	if err != nil {
 		log.Fatalf("invalid server address: %v", err)
+	}
+
+	ipCerts, err := parseIPCertConfig(*certMode, *acmeIPCerts, *acmeSrcIP, *acmeSrcIP6)
+	if err != nil {
+		log.Fatalf("derper: invalid ACME IP certificate settings: %v", err)
 	}
 
 	if *runSTUN {
@@ -356,7 +363,7 @@ func main() {
 	if serveTLS {
 		log.Printf("derper: serving on %s with TLS", *addr)
 		var certManager certProvider
-		certManager, err = certProviderByCertMode(*certMode, *certDir, *hostname, *acmeIPCerts, *acmeEABKid, *acmeEABKey, *acmeEmail)
+		certManager, err = certProviderByCertMode(*certMode, *certDir, *hostname, ipCerts, *acmeEABKid, *acmeEABKey, *acmeEmail)
 		if err != nil {
 			log.Fatalf("derper: can not start cert provider: %v", err)
 		}
